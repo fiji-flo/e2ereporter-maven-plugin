@@ -1,12 +1,43 @@
+/*******************************************************************************
+ * Copyright (c) 2009, 2015 Mountainminds GmbH & Co. KG and Contributors
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ * <p>
+ * Contributors:
+ * Evgeny Mandrikov - initial API and implementation
+ * Florian Merz - adopt to standalone plugin and extend for external sources
+ *******************************************************************************/
 package org.jacoco.maven;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-import org.jacoco.core.analysis.*;
-import org.jacoco.report.*;
+import org.apache.maven.doxia.siterenderer.Renderer;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.project.MavenProject;
+import org.apache.maven.reporting.MavenReportException;
+import org.jacoco.core.analysis.IBundleCoverage;
+import org.jacoco.core.analysis.ICoverageNode;
+import org.jacoco.core.data.ExecutionDataStore;
+import org.jacoco.core.data.SessionInfoStore;
+import org.jacoco.core.tools.ExecFileLoader;
+import org.jacoco.report.FileMultiReportOutput;
+import org.jacoco.report.IReportGroupVisitor;
+import org.jacoco.report.IReportVisitor;
+import org.jacoco.report.ISourceFileLocator;
+import org.jacoco.report.MultiReportVisitor;
+import org.jacoco.report.csv.CSVFormatter;
+import org.jacoco.report.html.HTMLFormatter;
+import org.jacoco.report.xml.XMLFormatter;
 
 /**
  * @phase verify
@@ -15,7 +46,25 @@ import org.jacoco.report.*;
  * @threadSafe
  * @since 0.7.6
  */
-public class E2EReportMojo extends AbstractReportMojo {
+public class E2EReportMojo extends ReportITMojo {
+
+    /**
+     * Output directory for the reports. Note that this parameter is only
+     * relevant if the goal is run from the command line or from the default
+     * build lifecycle. If the goal is run indirectly as part of a site
+     * generation, the output directory configured in the Maven Site Plugin is
+     * used instead.
+     *
+     * @parameter default-value="${project.reporting.outputDirectory}/jacoco-it"
+     */
+    private File outputDirectory;
+
+    /**
+     * File with execution data.
+     *
+     * @parameter default-value="${project.build.directory}/jacoco-it.exec"
+     */
+    private File dataFile;
 
     /**
      * @parameter
@@ -25,50 +74,163 @@ public class E2EReportMojo extends AbstractReportMojo {
      * @parameter
      */
     List<String> sourceFiles;
-
     /**
-     * @parameter default-value="${project.reporting.outputDirectory}/e2ereport"
-     */
-    private File outputDirectory;
-
-    /**
-     * File with execution data.
+     * Encoding of the generated reports.
      *
-     * @parameter default-value="${project.build.directory}/e2e.exec"
+     * @parameter property="project.reporting.outputEncoding"
+     *            default-value="UTF-8"
      */
-    private File dataFile;
+    String outputEncoding;
+    /**
+     * Encoding of the source files.
+     *
+     * @parameter property="project.build.sourceEncoding"
+     *            default-value="UTF-8"
+     */
+    String sourceEncoding;
+    /**
+     * A list of class files to include in the report. May use wildcard
+     * characters (* and ?). When not specified everything will be included.
+     *
+     * @parameter
+     */
+    List<String> includes;
+    /**
+     * A list of class files to exclude from the report. May use wildcard
+     * characters (* and ?). When not specified nothing will be excluded.
+     *
+     * @parameter
+     */
+    List<String> excludes;
+    /**
+     * Flag used to suppress execution.
+     *
+     * @parameter property="jacoco.skip" default-value="false"
+     */
+    boolean skip;
+    /**
+     * Maven project.
+     *
+     * @parameter property="project"
+     * @readonly
+     */
+    MavenProject project;
+    /**
+     * Doxia Site Renderer.
+     *
+     * @component
+     */
+    Renderer siteRenderer;
+    SessionInfoStore sessionInfoStore;
+    ExecutionDataStore executionDataStore;
 
-    private static String output = "e2ereport";
 
-    @Override
-    protected String getOutputDirectory() {
-        return outputDirectory.getAbsolutePath();
+    public String getDescription(final Locale locale) {
+        return getName(locale) + " Coverage Report.";
     }
 
     @Override
-    public void setReportOutputDirectory(final File reportOutputDirectory) {
-        if (reportOutputDirectory != null
-                && !reportOutputDirectory.getAbsolutePath().endsWith(
-                output)) {
-            outputDirectory = new File(reportOutputDirectory, output);
-        } else {
-            outputDirectory = reportOutputDirectory;
+    public boolean isExternalReport() {
+        return true;
+    }
+
+    @Override
+    protected MavenProject getProject() {
+        return project;
+    }
+
+    @Override
+    protected Renderer getSiteRenderer() {
+        return siteRenderer;
+    }
+
+    /**
+     * Returns the list of class files to include in the report.
+     *
+     * @return class files to include, may contain wildcard characters
+     */
+    List<String> getIncludes() {
+        return includes;
+    }
+
+    /**
+     * Returns the list of class files to exclude from the report.
+     *
+     * @return class files to exclude, may contain wildcard characters
+     */
+    List<String> getExcludes() {
+        return excludes;
+    }
+
+
+    @Override
+    public boolean canGenerateReport() {
+        if (skip) {
+            getLog().info(
+                    "Skipping JaCoCo execution because property jacoco.skip is set.");
+            return false;
+        }
+        if (!getDataFile().exists()) {
+            getLog().info(
+                    "Skipping JaCoCo execution due to missing execution data file:"
+                            + getDataFile());
+            return false;
+        }
+        final File classesDirectory = new File(getProject().getBuild()
+                .getOutputDirectory());
+        if (!classesDirectory.exists()) {
+            getLog().info(
+                    "Skipping JaCoCo execution due to missing classes directory:"
+                            + classesDirectory);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * This method is called when the report generation is invoked directly as a
+     * standalone Mojo.
+     */
+    @Override
+    public void execute() throws MojoExecutionException {
+        if (!canGenerateReport()) {
+            return;
+        }
+        try {
+            executeReport(Locale.getDefault());
+        } catch (final MavenReportException e) {
+            throw new MojoExecutionException("An error has occurred in "
+                    + getName(Locale.ENGLISH) + " report generation.", e);
         }
     }
 
     @Override
-    File getDataFile() {
-        return dataFile;
+    protected void executeReport(final Locale locale)
+            throws MavenReportException {
+        loadExecutionData();
+        try {
+            final IReportVisitor visitor = createVisitor(locale);
+            visitor.visitInfo(sessionInfoStore.getInfos(),
+                    executionDataStore.getContents());
+            createReport(visitor);
+            visitor.visitEnd();
+        } catch (final IOException e) {
+            throw new MavenReportException("Error while creating report: "
+                    + e.getMessage(), e);
+        }
     }
 
-    @Override
-    File getOutputDirectoryFile() {
-        return outputDirectory;
-    }
-
-    @Override
-    public String getOutputName() {
-        return output + "/index";
+    void loadExecutionData() throws MavenReportException {
+        final ExecFileLoader loader = new ExecFileLoader();
+        try {
+            loader.load(getDataFile());
+        } catch (final IOException e) {
+            throw new MavenReportException(
+                    "Unable to read execution data file " + getDataFile()
+                            + ": " + e.getMessage(), e);
+        }
+        sessionInfoStore = loader.getSessionInfoStore();
+        executionDataStore = loader.getExecutionDataStore();
     }
 
     void createReport(final IReportGroupVisitor visitor) throws IOException {
@@ -83,6 +245,41 @@ public class E2EReportMojo extends AbstractReportMojo {
         visitor.visitBundle(bundle, locator);
     }
 
+    void checkForMissingDebugInformation(final ICoverageNode node) {
+        if (node.getClassCounter().getTotalCount() > 0
+                && node.getLineCounter().getTotalCount() == 0) {
+            getLog().warn(
+                    "To enable source code annotation class files have to be compiled with debug information.");
+        }
+    }
+
+    IReportVisitor createVisitor(final Locale locale) throws IOException {
+        final List<IReportVisitor> visitors = new ArrayList<IReportVisitor>();
+        getOutputDirectoryFile().mkdirs();
+        final XMLFormatter xmlFormatter = new XMLFormatter();
+        xmlFormatter.setOutputEncoding(outputEncoding);
+        visitors.add(xmlFormatter.createVisitor(new FileOutputStream(new File(
+                getOutputDirectoryFile(), "jacoco.xml"))));
+        final CSVFormatter csvFormatter = new CSVFormatter();
+        csvFormatter.setOutputEncoding(outputEncoding);
+        visitors.add(csvFormatter.createVisitor(new FileOutputStream(new File(
+                getOutputDirectoryFile(), "jacoco.csv"))));
+        final HTMLFormatter htmlFormatter = new HTMLFormatter();
+        htmlFormatter.setOutputEncoding(outputEncoding);
+        htmlFormatter.setLocale(locale);
+        visitors.add(htmlFormatter.createVisitor(new FileMultiReportOutput(
+                getOutputDirectoryFile())));
+        return new MultiReportVisitor(visitors);
+    }
+
+    File resolvePath(final String path) {
+        File file = new File(path);
+        if (!file.isAbsolute()) {
+            file = new File(getProject().getBasedir(), path);
+        }
+        return file;
+    }
+
     List<File> getCompileSourceRoots() {
         final List<File> result = new ArrayList<File>();
         for (final Object path : getProject().getCompileSourceRoots()) {
@@ -94,10 +291,6 @@ public class E2EReportMojo extends AbstractReportMojo {
             result.add(resolvePath(sourceDir));
         }
         return result;
-    }
-
-    public String getName(final Locale locale) {
-            return "E2E Reporter";
     }
 
     private static class SourceFileCollection implements ISourceFileLocator {
@@ -133,5 +326,38 @@ public class E2EReportMojo extends AbstractReportMojo {
             return 4;
         }
     }
-}
 
+    @Override
+    protected String getOutputDirectory() {
+        return outputDirectory.getAbsolutePath();
+    }
+
+    @Override
+    public void setReportOutputDirectory(final File reportOutputDirectory) {
+        if (reportOutputDirectory != null
+                && !reportOutputDirectory.getAbsolutePath().endsWith(
+                "jacoco-it")) {
+            outputDirectory = new File(reportOutputDirectory, "jacoco-it");
+        } else {
+            outputDirectory = reportOutputDirectory;
+        }
+    }
+
+    File getDataFile() {
+        return dataFile;
+    }
+
+    File getOutputDirectoryFile() {
+        return outputDirectory;
+    }
+
+    @Override
+    public String getOutputName() {
+        return "jacoco-it/index";
+    }
+
+    public String getName(final Locale locale) {
+        return "E2E Reporter";
+    }
+
+}
