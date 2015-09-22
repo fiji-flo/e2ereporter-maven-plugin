@@ -15,7 +15,7 @@ import org.jacoco.report.*;
  * @threadSafe
  * @since 0.7.6
  */
-public class E2EReportMojo extends ReportITMojo {
+public class E2EReportMojo extends AbstractReportMojo {
 
     /**
      * @parameter
@@ -25,6 +25,51 @@ public class E2EReportMojo extends ReportITMojo {
      * @parameter
      */
     List<String> sourceFiles;
+
+    /**
+     * @parameter default-value="${project.reporting.outputDirectory}/e2ereport"
+     */
+    private File outputDirectory;
+
+    /**
+     * File with execution data.
+     *
+     * @parameter default-value="${project.build.directory}/e2e.exec"
+     */
+    private File dataFile;
+
+    private static String output = "e2ereport";
+
+    @Override
+    protected String getOutputDirectory() {
+        return outputDirectory.getAbsolutePath();
+    }
+
+    @Override
+    public void setReportOutputDirectory(final File reportOutputDirectory) {
+        if (reportOutputDirectory != null
+                && !reportOutputDirectory.getAbsolutePath().endsWith(
+                output)) {
+            outputDirectory = new File(reportOutputDirectory, output);
+        } else {
+            outputDirectory = reportOutputDirectory;
+        }
+    }
+
+    @Override
+    File getDataFile() {
+        return dataFile;
+    }
+
+    @Override
+    File getOutputDirectoryFile() {
+        return outputDirectory;
+    }
+
+    @Override
+    public String getOutputName() {
+        return output + "/index";
+    }
 
     void createReport(final IReportGroupVisitor visitor) throws IOException {
         final FileFilter fileFilter = new FileFilter(getIncludes(),
